@@ -15,7 +15,7 @@ class TeleoperationServer:
         # ZMQ设置
         self.cmd_context = zmq.Context()
         self.cmd_socket = self.cmd_context.socket(zmq.PULL)
-        self.cmd_socket.bind(f"tcp://{client_ip}:{cmd_port}")
+        self.cmd_socket.connect(f"tcp://{client_ip}:{cmd_port}")
         
         self.obs_context = zmq.Context()
         self.obs_socket = self.obs_context.socket(zmq.PUSH)

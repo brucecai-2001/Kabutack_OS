@@ -3,15 +3,17 @@ import json
 import time
 import threading
 import numpy as np
-from typing import Dict, Any, Optional, Callable
+import rerun as rr
 
+from typing import Dict, Any, Optional
 from src.utils.image import decode_image_from_b64
 
 class TeleoperationClient:
     """遥操作客户端，支持基础遥操作和键盘控制功能"""
 
     def __init__(self, remote_robot_ip: str = "localhost", cmd_port: int = 5555, obs_port: int = 5556,
-                 enable_keyboard_control: bool = False, max_linear_speed: float = 1.0, max_angular_speed: float = 1.0):
+                 enable_keyboard_control: bool = True, max_linear_speed: float = 1.0, max_angular_speed: float = 1.0,
+                 enable_rerun_logging: bool = True):
         """
         初始化遥操作客户端
         
@@ -22,11 +24,18 @@ class TeleoperationClient:
             enable_keyboard_control: 是否启用键盘控制功能
             max_linear_speed: 最大线性速度 (仅在启用键盘控制时使用)
             max_angular_speed: 最大角速度 (仅在启用键盘控制时使用)
+            enable_rerun_logging: 是否启用rerun数据记录
         """
         self.server_address = remote_robot_ip
         self.cmd_port = cmd_port
         self.obs_port = obs_port
         self.enable_keyboard_control = enable_keyboard_control
+        self.enable_rerun_logging = enable_rerun_logging
+        
+        # 初始化rerun
+        if self.enable_rerun_logging:
+            rr.init("teleoperation_client", spawn=True)
+            rr.log("description", rr.TextDocument("Teleoperation Client Data Visualization", media_type=rr.MediaType.MARKDOWN))
         
         # ZMQ设置
         self.cmd_context = zmq.Context()
@@ -45,9 +54,6 @@ class TeleoperationClient:
         self._running = False
         self._obs_thread = None
         
-        # 回调函数
-        self._observation_callback: Optional[Callable[[Dict[str, Any]], None]] = None
-        
         # 键盘控制相关属性（仅在启用时使用）
         if self.enable_keyboard_control:
             self.max_linear_speed = max_linear_speed
@@ -61,12 +67,12 @@ class TeleoperationClient:
             # 控制线程
             self._control_thread = None
             self._control_running = False
-        
+    
     def connect(self):
         """连接到遥操作服务器"""
         try:
             # 连接命令socket
-            self.cmd_socket.connect(f"tcp://*:{self.cmd_port}")
+            self.cmd_socket.bind(f"tcp://*:{self.cmd_port}")
             
             # 连接观测socket
             self.obs_socket.connect(f"tcp://{self.server_address}:{self.obs_port}")
@@ -100,6 +106,21 @@ class TeleoperationClient:
         
         print("Disconnected from teleoperation server")
     
+    def _log_state_to_rerun(self, state_data: Dict[str, Any]):
+        """将状态数据记录到rerun"""
+        if not self.enable_rerun_logging or not state_data:
+            return
+            
+        try:
+            # 记录位置信息
+            if 'position' in state_data:
+                pos = state_data['position']
+                if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                    rr.log("robot/position", rr.Points3D([pos[:3]], colors=[0, 255, 0]))
+
+        except Exception as e:
+            print(f"Failed to log state to rerun: {e}")
+    
     def _obs_receive_loop(self):
         """观测数据接收循环"""
         while self._running:
@@ -114,6 +135,9 @@ class TeleoperationClient:
                     # 解析状态数据
                     if 'state' in observation and observation['state']:
                         self._latest_state = observation['state']
+                        # 记录状态数据到rerun
+                        if self.enable_rerun_logging:
+                            self._log_state_to_rerun(observation['state'])
                     
                     # 解析图像数据
                     if 'front_image' in observation and observation['front_image']:
@@ -121,12 +145,11 @@ class TeleoperationClient:
                             image = decode_image_from_b64(observation['front_image'])
                             if image is not None:
                                 self._latest_image = image
+                                # 记录图像数据到rerun
+                                if self.enable_rerun_logging:
+                                    rr.log("camera/front_image", rr.Image(image))
                         except Exception as e:
                             print(f"Failed to decode image: {e}")
-                
-                # 调用回调函数
-                if self._observation_callback:
-                    self._observation_callback(observation)
                     
             except zmq.Again:
                 # 没有消息可接收
@@ -173,10 +196,6 @@ class TeleoperationClient:
         with self._lock:
             return self._latest_image.copy() if self._latest_image is not None else None
     
-    def set_observation_callback(self, callback: Callable[[Dict[str, Any]], None]):
-        """设置观测数据回调函数"""
-        self._observation_callback = callback
-    
     def is_connected(self) -> bool:
         """检查是否已连接"""
         return self._running
@@ -218,36 +237,65 @@ class TeleoperationClient:
     def _keyboard_control_loop(self):
         """键盘控制循环"""
         try:
-            import keyboard
+            from pynput import keyboard
         except ImportError:
-            print("Please install keyboard library: pip install keyboard")
+            print("Please install pynput library: pip install pynput")
             return
         
-        while self._control_running:
+        # 按键状态跟踪
+        pressed_keys = set()
+        
+        def on_press(key):
             try:
+                pressed_keys.add(key.char)
+            except AttributeError:
+                # 特殊键处理
+                if key == keyboard.Key.space:
+                    pressed_keys.add('space')
+                elif key == keyboard.Key.esc:
+                    pressed_keys.add('esc')
+        
+        def on_release(key):
+            try:
+                pressed_keys.discard(key.char)
+            except AttributeError:
+                if key == keyboard.Key.space:
+                    pressed_keys.discard('space')
+                elif key == keyboard.Key.esc:
+                    pressed_keys.discard('esc')
+        
+        # 启动键盘监听器
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener.start()
+        
+        print("Keyboard control active. Press keys to control:")
+        print("W/S: Forward/Backward, A/D: Left/Right, Q/E: Turn Left/Right, Space: Stop, ESC: Quit")
+        
+        try:
+            while self._control_running:
                 # 重置速度
                 vx, vy, vyaw = 0.0, 0.0, 0.0
                 
                 # 检查按键状态
-                if keyboard.is_pressed('w'):
+                if 'w' in pressed_keys:
                     vx = self.max_linear_speed
-                elif keyboard.is_pressed('s'):
+                elif 's' in pressed_keys:
                     vx = -self.max_linear_speed
                 
-                if keyboard.is_pressed('a'):
+                if 'a' in pressed_keys:
                     vy = self.max_linear_speed
-                elif keyboard.is_pressed('d'):
+                elif 'd' in pressed_keys:
                     vy = -self.max_linear_speed
                 
-                if keyboard.is_pressed('q'):
+                if 'q' in pressed_keys:
                     vyaw = self.max_angular_speed
-                elif keyboard.is_pressed('e'):
+                elif 'e' in pressed_keys:
                     vyaw = -self.max_angular_speed
                 
-                if keyboard.is_pressed('space'):
+                if 'space' in pressed_keys:
                     vx = vy = vyaw = 0.0
                 
-                if keyboard.is_pressed('esc'):
+                if 'esc' in pressed_keys:
                     break
                 
                 # 发送命令
@@ -255,30 +303,23 @@ class TeleoperationClient:
                 
                 time.sleep(0.1)  # 10Hz控制频率
                 
-            except Exception as e:
-                print(f"Keyboard control error: {e}")
-                time.sleep(0.1)
+        except Exception as e:
+            print(f"Keyboard control error: {e}")
+        finally:
+            listener.stop()
         
         # 停止机器人
-        self.send_move_command(0.0, 0.0, 0.0)
         print("Keyboard control stopped")
 
 
 if __name__ == "__main__":
-    
+
     remote_robot_ip = "192.168.31.86"
     try:
         # 创建启用键盘控制的遥操作客户端
         with TeleoperationClient(remote_robot_ip, enable_keyboard_control=True) as client:
             client.connect()
-            
-            # 设置观测数据回调
-            def on_observation(obs):
-                if 'timestamp' in obs:
-                    print(f"Received observation at {obs['timestamp']}")
-            
-            client.set_observation_callback(on_observation)
-            
+
             # 启动键盘控制
             client.start_keyboard_control()
             

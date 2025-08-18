@@ -32,7 +32,7 @@ class Go2Robot(RobotInterface):
             self._running = True
             
             # 初始化Unitree SDK
-            ChannelFactoryInitialize(0)
+            ChannelFactoryInitialize(0, 'eth0')
             
             # 初始化SportClient, 控制高层运动
             self.sport_client = SportClient()
@@ -48,6 +48,7 @@ class Go2Robot(RobotInterface):
             self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
             self.lowstate_subscriber.Init(self._low_state_message_handler, 10)
             
+            self.sport_client.StandUp()
             print("Go2Robot initialized successfully.")
             
         except Exception as e:
@@ -64,7 +65,7 @@ class Go2Robot(RobotInterface):
             try:
                 # 停止机器人运动
                 self.sport_client.Damp()
-                time.sleep(1)
+                time.sleep(5)
                 self.sport_client.StandDown()
             except:
                 pass
