@@ -48,7 +48,6 @@ class Go2Robot(RobotInterface):
             self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
             self.lowstate_subscriber.Init(self._low_state_message_handler, 10)
             
-            self.sport_client.StandUp()
             print("Go2Robot initialized successfully.")
             
         except Exception as e:
@@ -137,12 +136,3 @@ class Go2Robot(RobotInterface):
                 "timestamp": time.time()
             }
         return self.observation.copy()
-    
-    def __enter__(self):
-        """上下文管理器入口"""
-        self.initialize()
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """上下文管理器退出"""
-        self.shutdown()
