@@ -88,20 +88,3 @@ def load_robot(robot_type: str):
         
     else:
         raise ValueError(f"Unknown robot type: {robot_type}")
-
-if __name__ == "__main__":
-    
-    robot_type = "go2"
-    robot = None
-    
-    try:
-        robot = load_robot(robot_type)
-        server = TeleoperationServer(robot, "192.168.31.158")
-        server.start()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        if robot:
-            robot.shutdown()
