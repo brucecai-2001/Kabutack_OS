@@ -6,7 +6,7 @@ from src.teleoperation.teleoperation_client import TeleoperationClient
 
 if __name__ == '__main__':
     teleoperation_type = "keyboard"
-    robot_ip = ""
+    robot_ip = "192.168.31.86"
     client = None
 
     try:

@@ -1,239 +1,361 @@
-import sys
-import os
+import argparse
+import time
 import cv2
 import numpy as np
-import time
+from typing import Dict, Any, Optional, Tuple, List
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from src.hardware_interface.go2 import Go2ROS2Client
-from src.core_modules.visual.yolo.yolo import YoloMultiTask
-from src.core_modules.controller.pid import PIDController
+from src.hardware_interface.go2 import Go2Robot
+from src.core_modules.visual.grounding_dino.groundingd_dino import GroundingDINO
+from src.core_modules.visual.co_tracker.co_tracker import CoTrackerCamera
 
-# 配置参数
-GO2_ADDRESS = "192.168.31.86"
-COMMAND_PORT = 5555
-STATE_PORT = 5557
-IMG_PORT = 5556
-YOLO_MODEL_PATH = "yolo11n.pt"
-TARGET_CLASS = "person"
-
-# 跟踪参数
-TARGET_CENTER_X = 320  # 图像中心X坐标（假设640x480分辨率）
-TARGET_CENTER_Y = 240  # 图像中心Y坐标
-TARGET_BOX_AREA = 50000  # 目标框的理想面积
-DETECTION_TIMEOUT = 2.0  # 检测超时时间（秒）
-
-# 全局变量
-tracking = False
-last_detection_time = 0
-
-def detect_target(detector, image, target_class):
-    """
-    检测目标对象
+class Go2VisualTracker:
+    def __init__(self, target_object: str, tracking_speed: float = 0.5) -> None:
+        """
+        初始化Go2视觉跟踪器
+        
+        Args:
+            target_object: 要跟踪的目标物体名称
+            tracking_speed: 跟踪速度系数 (0.0-1.0)
+        """
+        self.target_object = target_object
+        self.tracking_speed = max(0.0, min(1.0, tracking_speed))  # 限制在0-1范围内
+        
+        # 初始化机器人
+        self.robot = Go2Robot()
+        
+        # 初始化视觉模型
+        self.detector = GroundingDINO()
+        self.tracker = CoTrackerCamera()
+        
+        # 跟踪状态
+        self.tracking_active = False
+        self.target_bbox = None  # [x1, y1, x2, y2]
+        self.track_points = None  # 跟踪点
+        self.prev_frame = None  # 上一帧图像
+        
+        print(f"Go2VisualTracker initialized. Target object: {target_object}")
     
-    Args:
-        detector: YOLO检测器
-        image: 输入图像
-        target_class: 目标类别
+    def initialize(self) -> None:
+        """初始化机器人和视觉模型"""
+        try:
+            # 初始化机器人
+            self.robot.initialize()
+            time.sleep(2)  # 等待机器人初始化完成
+            
+            print("Go2VisualTracker ready. Press Ctrl+C to stop.")
+        except Exception as e:
+            print(f"Failed to initialize Go2VisualTracker: {e}")
+            self.shutdown()
+            raise
+    
+    def shutdown(self) -> None:
+        """关闭所有资源"""
+        print("Shutting down Go2VisualTracker...")
+        self.tracking_active = False
         
-    Returns:
-        target_box: 目标边界框 [x1, y1, x2, y2]，如果未检测到则返回None
-    """
-    try:
-        # 使用YOLO进行检测
-        results = detector(image)
+        # 关闭机器人
+        if hasattr(self, 'robot'):
+            self.robot.shutdown()
         
-        if "boxes_xyxy" not in results or len(results["boxes_xyxy"]) == 0:
+        cv2.destroyAllWindows()
+        print("Go2VisualTracker shutdown completed.")
+    
+    def detect_target(self, frame: np.ndarray) -> Optional[List[float]]:
+        """
+        使用GroundingDINO检测目标物体
+        
+        Args:
+            frame: 输入图像
+            
+        Returns:
+            检测到的目标边界框 [x1, y1, x2, y2] 或 None
+        """
+        if frame is None:
             return None
         
-        # 查找目标类别
-        target_boxes = []
-        for i, name in enumerate(results["names"]):
-            if name == target_class:
-                box = results["boxes_xyxy"][i].cpu().numpy()
-                conf = results["confidence"][i].cpu().numpy()
-                target_boxes.append((box, conf))
+        # 使用GroundingDINO检测目标
+        detections = self.detector.detect(frame, text_prompt=self.target_object)
         
-        if not target_boxes:
-            return None
+        # 如果检测到目标，返回置信度最高的边界框
+        if detections and len(detections) > 0:
+            # 获取置信度最高的检测结果
+            best_detection = max(detections, key=lambda x: x['score'])
+            if best_detection['score'] > 0.5:  # 置信度阈值
+                return best_detection['bbox']  # [x1, y1, x2, y2]
         
-        # 选择置信度最高的目标
-        best_box = max(target_boxes, key=lambda x: x[1])[0]
-        return best_box
-        
-    except Exception as e:
-        print(f"目标检测错误: {e}")
         return None
-
-def calculate_control_commands(target_box, image_shape, pid_x, pid_y, pid_yaw):
-    """
-    根据目标位置计算控制命令
     
-    Args:
-        target_box: 目标边界框 [x1, y1, x2, y2]
-        image_shape: 图像尺寸 (height, width)
-        pid_x, pid_y, pid_yaw: PID控制器
+    def initialize_tracking(self, frame: np.ndarray, bbox: List[float]) -> bool:
+        """
+        初始化CoTracker跟踪器
         
-    Returns:
-        vx, vy, vyaw: 控制命令
-    """
-    h, w = image_shape[:2]
-    
-    # 计算目标中心点
-    center_x = (target_box[0] + target_box[2]) / 2
-    center_y = (target_box[1] + target_box[3]) / 2
-    
-    # 计算目标框面积
-    box_area = (target_box[2] - target_box[0]) * (target_box[3] - target_box[1])
-    
-    # 计算误差
-    error_x = center_x - w / 2  # X轴误差（像素）
-    error_y = h / 2 - center_y  # Y轴误差（像素，注意图像坐标系）
-    error_area = TARGET_BOX_AREA - box_area  # 面积误差
-    
-    # 归一化误差
-    error_x_norm = error_x / (w / 2)  # 归一化到[-1, 1]
-    error_y_norm = error_y / (h / 2)  # 归一化到[-1, 1]
-    error_area_norm = error_area / TARGET_BOX_AREA  # 归一化面积误差
-    
-    # 使用PID控制器计算控制命令
-    vyaw = -pid_yaw.update(error_x_norm)  # 偏航控制（左右旋转）
-    vx = pid_y.update(error_area_norm)    # 前后移动控制
-    vy = -pid_x.update(error_y_norm)      # 左右移动控制
-    
-    return vx, vy, vyaw
-
-def draw_tracking_info(image, target_box=None, tracking_status=False):
-    """
-    在图像上绘制跟踪信息
-    
-    Args:
-        image: 输入图像
-        target_box: 目标边界框
-        tracking_status: 跟踪状态
+        Args:
+            frame: 输入图像
+            bbox: 目标边界框 [x1, y1, x2, y2]
+            
+        Returns:
+            是否成功初始化跟踪
+        """
+        if frame is None or bbox is None:
+            return False
         
-    Returns:
-        annotated_image: 标注后的图像
-    """
-    annotated = image.copy()
-    h, w = image.shape[:2]
+        try:
+            # 在边界框内均匀采样跟踪点
+            x1, y1, x2, y2 = [int(coord) for coord in bbox]
+            
+            # 确保边界框在图像范围内
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w-1, x2), min(h-1, y2)
+            
+            # 在目标区域内生成跟踪点
+            grid_size = 5
+            x_points = np.linspace(x1, x2, grid_size)
+            y_points = np.linspace(y1, y2, grid_size)
+            
+            track_points = []
+            for y in y_points:
+                for x in x_points:
+                    track_points.append([x, y])
+            
+            # 初始化跟踪器
+            self.track_points = np.array(track_points)
+            self.prev_frame = frame.copy()
+            self.target_bbox = bbox
+            self.tracking_active = True
+            
+            return True
+        except Exception as e:
+            print(f"Failed to initialize tracking: {e}")
+            return False
     
-    # 绘制图像中心十字线
-    cv2.line(annotated, (w//2-20, h//2), (w//2+20, h//2), (0, 255, 0), 2)
-    cv2.line(annotated, (w//2, h//2-20), (w//2, h//2+20), (0, 255, 0), 2)
-    
-    # 绘制目标框
-    if target_box is not None:
-        x1, y1, x2, y2 = target_box.astype(int)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+    def update_tracking(self, frame: np.ndarray) -> Optional[List[float]]:
+        """
+        更新跟踪状态
         
-        # 绘制目标中心点
-        center_x = (x1 + x2) // 2
-        center_y = (y1 + y2) // 2
-        cv2.circle(annotated, (center_x, center_y), 5, (0, 0, 255), -1)
+        Args:
+            frame: 当前帧图像
+            
+        Returns:
+            更新后的目标边界框 [x1, y1, x2, y2] 或 None
+        """
+        if not self.tracking_active or frame is None or self.prev_frame is None:
+            return None
         
-        # 绘制连接线
-        cv2.line(annotated, (w//2, h//2), (center_x, center_y), (255, 0, 0), 2)
+        try:
+            # 使用CoTracker更新跟踪点
+            tracked_points = self.tracker.track(
+                self.prev_frame, 
+                frame, 
+                self.track_points
+            )
+            
+            # 更新跟踪点和上一帧
+            self.track_points = tracked_points
+            self.prev_frame = frame.copy()
+            
+            # 计算新的边界框
+            if len(tracked_points) > 0:
+                x_coords = tracked_points[:, 0]
+                y_coords = tracked_points[:, 1]
+                
+                # 过滤掉异常值
+                valid_indices = np.where(
+                    (x_coords >= 0) & (x_coords < frame.shape[1]) &
+                    (y_coords >= 0) & (y_coords < frame.shape[0])
+                )[0]
+                
+                if len(valid_indices) > 0:
+                    x_min = np.min(x_coords[valid_indices])
+                    y_min = np.min(y_coords[valid_indices])
+                    x_max = np.max(x_coords[valid_indices])
+                    y_max = np.max(y_coords[valid_indices])
+                    
+                    # 更新目标边界框
+                    self.target_bbox = [x_min, y_min, x_max, y_max]
+                    return self.target_bbox
+            
+            # 如果跟踪失败，返回None
+            return None
+        except Exception as e:
+            print(f"Tracking update failed: {e}")
+            self.tracking_active = False
+            return None
+    
+    def calculate_control_commands(self, frame: np.ndarray, bbox: List[float]) -> Tuple[float, float, float]:
+        """
+        根据目标位置计算控制命令
         
-        # 显示目标信息
-        cv2.putText(annotated, f"Target: {TARGET_CLASS}", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        Args:
+            frame: 当前帧图像
+            bbox: 目标边界框 [x1, y1, x2, y2]
+            
+        Returns:
+            控制命令 (vx, vy, vyaw)
+        """
+        if frame is None or bbox is None:
+            return 0.0, 0.0, 0.0
+        
+        # 计算目标中心点
+        x1, y1, x2, y2 = bbox
+        target_center_x = (x1 + x2) / 2
+        target_center_y = (y1 + y2) / 2
+        
+        # 计算图像中心
+        frame_height, frame_width = frame.shape[:2]
+        frame_center_x = frame_width / 2
+        frame_center_y = frame_height / 2
+        
+        # 计算目标相对于中心的偏移
+        offset_x = target_center_x - frame_center_x
+        offset_y = target_center_y - frame_center_y
+        
+        # 归一化偏移量
+        norm_offset_x = offset_x / (frame_width / 2)
+        norm_offset_y = offset_y / (frame_height / 2)
+        
+        # 计算目标大小占比
+        target_width = x2 - x1
+        target_height = y2 - y1
+        size_ratio = (target_width * target_height) / (frame_width * frame_height)
+        
+        # 计算控制命令
+        # 水平偏移控制旋转
+        vyaw = -norm_offset_x * 0.5 * self.tracking_speed
+        
+        # 前进速度基于目标大小
+        vx = 0.0
+        if size_ratio < 0.1:  # 目标太小，需要靠近
+            vx = 0.3 * self.tracking_speed
+        elif size_ratio > 0.3:  # 目标太大，需要后退
+            vx = -0.2 * self.tracking_speed
+        
+        # 侧向移动基于水平偏移
+        vy = 0.0
+        if abs(norm_offset_x) > 0.3:  # 如果水平偏移较大，使用侧向移动辅助
+            vy = norm_offset_x * 0.2 * self.tracking_speed
+        
+        # 限制命令范围
+        vx = max(-0.5, min(0.5, vx))
+        vy = max(-0.3, min(0.3, vy))
+        vyaw = max(-0.8, min(0.8, vyaw))
+        
+        return vx, vy, vyaw
     
-    # 显示跟踪状态
-    status = "TRACKING" if tracking_status else "SEARCHING"
-    color = (0, 255, 0) if tracking_status else (0, 0, 255)
-    cv2.putText(annotated, f"Status: {status}", (10, h-20), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    def visualize(self, frame: np.ndarray, bbox: Optional[List[float]] = None) -> np.ndarray:
+        """
+        可视化跟踪结果
+        
+        Args:
+            frame: 输入图像
+            bbox: 目标边界框 [x1, y1, x2, y2]
+            
+        Returns:
+            可视化后的图像
+        """
+        if frame is None:
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        
+        vis_frame = frame.copy()
+        
+        # 绘制目标边界框
+        if bbox is not None:
+            x1, y1, x2, y2 = [int(coord) for coord in bbox]
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(vis_frame, self.target_object, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # 绘制跟踪点
+        if self.tracking_active and self.track_points is not None:
+            for point in self.track_points:
+                x, y = int(point[0]), int(point[1])
+                if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
+                    cv2.circle(vis_frame, (x, y), 2, (0, 0, 255), -1)
+        
+        # 添加状态信息
+        status_text = f"Tracking: {'Active' if self.tracking_active else 'Inactive'}"
+        cv2.putText(vis_frame, status_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        return vis_frame
     
-    return annotated
+    def run(self) -> None:
+        """运行视觉跟踪主循环"""
+        try:
+            self.initialize()
+            
+            detection_interval = 30  # 每30帧进行一次检测
+            frame_count = 0
+            
+            while True:
+                # 获取机器人观测数据
+                observation = self.robot.get_observation()
+                
+                # 从观测中获取图像
+                if observation["front_image"] is None:
+                    print("No image available")
+                    time.sleep(0.1)
+                    continue
+                
+                # 解码Base64图像
+                image_data = np.frombuffer(observation["front_image"], dtype=np.uint8)
+                frame = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+                
+                # 如果没有激活跟踪或者需要重新检测
+                if not self.tracking_active or frame_count % detection_interval == 0:
+                    # 检测目标
+                    bbox = self.detect_target(frame)
+                    
+                    if bbox is not None:
+                        # 初始化或重新初始化跟踪
+                        self.initialize_tracking(frame, bbox)
+                        print(f"Target {self.target_object} detected and tracking initialized")
+                
+                # 更新跟踪
+                if self.tracking_active:
+                    bbox = self.update_tracking(frame)
+                    
+                    if bbox is not None:
+                        # 计算控制命令
+                        vx, vy, vyaw = self.calculate_control_commands(frame, bbox)
+                        
+                        # 发送控制命令到机器人
+                        self.robot.move(vx, vy, vyaw)
+                        
+                        print(f"Tracking: vx={vx:.2f}, vy={vy:.2f}, vyaw={vyaw:.2f}")
+                    else:
+                        # 跟踪失败，停止机器人
+                        self.robot.move(0.0, 0.0, 0.0)
+                        self.tracking_active = False
+                        print("Tracking lost")
+                
+                # 可视化
+                vis_frame = self.visualize(frame, self.target_bbox if self.tracking_active else None)
+                cv2.imshow("Go2 Visual Tracking", vis_frame)
+                
+                # 按ESC键退出
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:  # ESC
+                    break
+                
+                frame_count += 1
+                
+        except KeyboardInterrupt:
+            print("Interrupted by user")
+        finally:
+            self.shutdown()
 
 def main():
-    global tracking, last_detection_time
+    """主函数"""
+    parser = argparse.ArgumentParser(description="Go2 Visual Tracking")
+    parser.add_argument("--target", type=str, default="person",
+                        help="Target object to track (default: person)")
+    parser.add_argument("--speed", type=float, default=0.5,
+                        help="Tracking speed factor (0.0-1.0, default: 0.5)")
+    args = parser.parse_args()
     
-    print(f"连接到Go2机器人: {GO2_ADDRESS}")
-    
-    try:
-        # 初始化Go2客户端
-        client = Go2ROS2Client(GO2_ADDRESS, COMMAND_PORT, STATE_PORT, IMG_PORT)
-        
-        # 初始化YOLO检测器
-        detector = YoloMultiTask(YOLO_MODEL_PATH, task="detect")
-        
-        # 初始化PID控制器
-        pid_x = PIDController(kp=0.5, ki=0.1, kd=0.05, dt=0.1, output_limits=(-0.5, 0.5))
-        pid_y = PIDController(kp=0.8, ki=0.1, kd=0.1, dt=0.1, output_limits=(-0.8, 0.8))
-        pid_yaw = PIDController(kp=1.0, ki=0.1, kd=0.1, dt=0.1, output_limits=(-1.0, 1.0))
-        
-        print(f"开始跟踪目标: {TARGET_CLASS}")
-        print("按 'q' 退出，按 's' 开始/停止跟踪")
-        
-        while True:
-            # 获取最新图像
-            image = client.get_latest_image()
-            
-            if image is None:
-                print("等待图像数据...")
-                time.sleep(0.1)
-                continue
-            
-            # 检测目标
-            target_box = detect_target(detector, image, TARGET_CLASS)
-            
-            if target_box is not None:
-                last_detection_time = time.time()
-                
-                if tracking:
-                    # 计算控制命令
-                    vx, vy, vyaw = calculate_control_commands(target_box, image.shape, 
-                                                            pid_x, pid_y, pid_yaw)
-                    
-                    # 发送控制命令
-                    client.send_move_command(vx, vy, vyaw)
-                    
-                    print(f"跟踪中 - vx: {vx:.2f}, vy: {vy:.2f}, vyaw: {vyaw:.2f}")
-            else:
-                # 检查是否超时
-                if time.time() - last_detection_time > DETECTION_TIMEOUT:
-                    if tracking:
-                        # 停止机器人
-                        client.send_move_command(0, 0, 0)
-                        print("目标丢失，停止移动")
-            
-            # 绘制跟踪信息
-            annotated_image = draw_tracking_info(image, target_box, tracking)
-            
-            # 显示图像
-            cv2.imshow("Go2 Visual Tracking", annotated_image)
-            
-            # 处理按键
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('s'):
-                tracking = not tracking
-                if not tracking:
-                    client.send_move_command(0, 0, 0)  # 停止移动
-                    # 重置PID控制器
-                    pid_x.reset()
-                    pid_y.reset()
-                    pid_yaw.reset()
-                print(f"跟踪状态: {'开启' if tracking else '关闭'}")
-            
-            time.sleep(0.1)  # 控制循环频率
-            
-    except KeyboardInterrupt:
-        print("\n收到中断信号，正在退出...")
-    except Exception as e:
-        print(f"运行时错误: {e}")
-    finally:
-        # 停止机器人并清理资源
-        try:
-            client.send_move_command(0, 0, 0)
-            client.close()
-        except:
-            pass
-        cv2.destroyAllWindows()
-        print("视觉跟踪系统已关闭")
+    tracker = Go2VisualTracker(target_object=args.target, tracking_speed=args.speed)
+    tracker.run()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
